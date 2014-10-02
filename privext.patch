@@ -1,0 +1,393 @@
+Index: Makefile
+===================================================================
+--- Makefile	(Revision 5028)
++++ Makefile	(Arbeitskopie)
+@@ -140,7 +140,7 @@
+ MASTER_LIBS= $(STD_LIBS) -L$(WINBIN) -L$(WINLIB) -lzlib1 -lenet -lws2_32 -lwinmm
+ else
+ SERVER_INCLUDES= -DSTANDALONE $(INCLUDES)
+-SERVER_LIBS= -Lenet -lenet -lz
++SERVER_LIBS= -Lenet -lenet -lz -lGeoIP
+ MASTER_LIBS= $(SERVER_LIBS)
+ endif
+ SERVER_OBJS= \
+@@ -151,7 +151,8 @@
+ 	engine/server-standalone.o \
+ 	engine/worldio-standalone.o \
+ 	fpsgame/entities-standalone.o \
+-	fpsgame/server-standalone.o
++	fpsgame/server-standalone.o \
++	fpsgame/privext-standalone.o
+ 
+ MASTER_OBJS= \
+ 	shared/crypto-standalone.o \
+@@ -188,6 +189,8 @@
+ %-standalone.o: %.cpp
+ 	$(CXX) $(CXXFLAGS) -c -o $@ $<
+ 
++%privext-standalone.o: override CXXFLAGS+= -std=c++0x
++
+ $(CLIENT_OBJS): CXXFLAGS += $(CLIENT_INCLUDES)
+ $(filter shared/%,$(CLIENT_OBJS)): $(filter shared/%,$(CLIENT_PCH))
+ $(filter engine/%,$(CLIENT_OBJS)): $(filter engine/%,$(CLIENT_PCH))
+Index: fpsgame/extinfo.h
+===================================================================
+--- fpsgame/extinfo.h	(Revision 5028)
++++ fpsgame/extinfo.h	(Arbeitskopie)
+@@ -47,7 +47,7 @@
+         putint(q, ci->state.gunselect);
+         putint(q, ci->privilege);
+         putint(q, ci->state.state);
+-        uint ip = getclientip(ci->clientnum);
++        uint ip = privext::getip(getclientip(ci->clientnum));
+         q.put((uchar*)&ip, 3);
+         sendserverinforeply(q);
+     }
+Index: fpsgame/privext.cpp
+===================================================================
+--- fpsgame/privext.cpp	(Revision 0)
++++ fpsgame/privext.cpp	(Arbeitskopie)
+@@ -0,0 +1,250 @@
++#include <GeoIP.h>
++#include <enet/enet.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <fstream>
++#include <iostream>
++#include <vector>
++#include <unordered_map>
++#include <cchar.h>
++
++#ifndef __has_builtin
++#define __has_builtin(x) 0
++#endif
++
++namespace privext {
++namespace {
++
++struct range;
++struct pool;
++
++const size_t maxpoolsize = 100;
++constexpr const char *whoisdbname = "GeoIPCountryWhois.csv";
++constexpr const char *geoipdbname = "GeoIP.dat";
++std::unordered_map<cchar, pool*> ipmap;
++bool randomips = !!getenv("PRIVEXT_ENABLE_IP_RANDOMIZATION");
++GeoIP *geoip;
++
++void seedrng()
++{
++    unsigned int sv = 0;
++
++#if __has_builtin(__builtin_readcyclecounter)
++    sv = (unsigned int)__builtin_readcyclecounter();
++#else
++    sv = (unsigned int)time(NULL);
++#endif
++
++    sv += enet_time_get();
++    srand(sv);
++}
++
++unsigned int getrandomnum(unsigned int max) { return rand() % max; }
++
++struct range
++{
++    uint32_t start;
++    uint32_t end;
++
++    size_t numips() const { return end - start; }
++};
++
++struct pool
++{
++    std::vector<range> ranges;
++
++    size_t numranges() const { return ranges.size(); }
++
++    bool isfull() const
++    {
++        const size_t n = numranges();
++        return (randomips ? n >= maxpoolsize : n >= 1);
++    }
++
++    bool addrange(const range &r)
++    {
++        if (isfull()) return false;
++        ranges.push_back(r);
++        return true;
++    }
++
++    uint32_t getip(bool verify = false) const
++    {
++        if (!randomips) return ranges[0].start;
++        seedrng();
++        const range &r = ranges[getrandomnum(numranges())];
++        uint32_t ip = getrandomnum(r.end - r.start + 1) + r.start;
++        if (verify && (ip < r.start || ip > r.end)) abort();
++        return ip;
++    }
++};
++
++inline bool skip(const char *&str, int c)
++{
++    while (*str && *str != c) ++str;
++    if (*str) ++str;
++    return *str;
++}
++
++inline const char *findstaticstr(const char *cc)
++{
++    for (auto &scc : GeoIP_country_code) if (!strcmp(scc, cc)) return scc;
++    return "unknown";
++}
++
++inline pool *getpool(const char *cc, bool add = false)
++{
++    auto p = ipmap.find(cc);
++    if (p != ipmap.end()) return p->second;
++    if (!add) return nullptr;
++    pool *np = new pool;
++    ipmap.insert(std::pair<cchar, pool*>(findstaticstr(cc), np));
++    return np;
++}
++
++void initipmap()
++{
++    std::ifstream whoisdb(whoisdbname);
++    std::string line;
++    size_t numranges = 0;
++    size_t numaddedranges = 0;
++    char cc[4];
++    range r;
++
++    if (!whoisdb.good())
++    {
++        std::cerr << "cannot open " << whoisdbname << std::endl;
++        return;
++    }
++    
++    memset(cc, '\0', sizeof(cc));
++
++    while (std::getline(whoisdb, line))
++    {
++        // "1.0.0.0","1.0.0.255","16777216","16777471","AU","Australia"
++
++        const char *str = line.c_str(); // parse as C string
++
++        if (!skip(str, ',')) continue; // ipstr 1
++        if (!skip(str, ',')) continue; // ipstr 2
++        if (!skip(str, '"')) continue; // ipnum 1
++
++        r.start = strtoul(str, NULL, 10);
++
++        if (!skip(str, '"')) continue;
++        if (!skip(str, ',')) continue;
++        if (!skip(str, '"')) continue; // ipnum 2
++
++        r.end = strtoul(str, NULL, 10);
++
++        if (!skip(str, '"')) continue;
++        if (!skip(str, ',')) continue;
++        if (!skip(str, '"')) continue; // country code
++
++        const char *pcc = str;
++
++        if (!skip(str, '"')) continue;
++        if (str - pcc != 3) continue;
++
++        memcpy(cc, pcc, 2);
++
++        ++numranges;
++        if (r.numips() <= 4096u) continue;
++        if (getpool(cc, true)->addrange(r)) ++numaddedranges;
++    }
++
++    std::cerr << "privext:  countries: " << ipmap.size()
++              << "  ranges: " << numranges
++              << "  added ranges: " << numaddedranges << std::endl;
++}
++
++void deinitmap()
++{
++    for (auto &c : ipmap) delete c.second;
++    ipmap.clear();
++}
++
++void savememory() { for (auto &c : ipmap) c.second->ranges.shrink_to_fit(); }
++
++void verify()
++{
++    if (!geoip) return;
++
++    uint32_t ip;
++    const char *code;
++    size_t numips = 0u;
++    size_t failcnt = 0u;
++
++    for (auto &c : ipmap)
++    {
++        std::cerr << "verifying " << c.first.c_str() << std::endl;
++        c.second->getip(true);
++
++        for (const range &r : c.second->ranges)
++        {
++            ip = r.start;
++            numips += r.numips();
++
++            for (ip = r.start; ip <= r.end; ++ip)
++            {
++                code = GeoIP_country_code_by_ipnum(geoip, ip);
++                if (!code) code = "unknown";
++
++                if (c.first != code)
++                {
++                    ++failcnt;
++
++                    std::cerr << "privext: country does not match: "
++                              << c.first.c_str()
++                              << " != " << code << std::endl;
++                }
++            }
++        }
++    }
++
++    std::cerr << "checked " << numips << " ip addresses, "
++              << "fail count: " << failcnt << std::endl;
++}
++
++void initgeoip() { geoip = GeoIP_open(geoipdbname, GEOIP_MEMORY_CACHE); }
++
++void deinitgeoip()
++{
++    if (!geoip) return;
++    GeoIP_delete(geoip);
++}
++
++struct init
++{
++    init()
++    {
++        initgeoip();
++        initipmap();
++        savememory();
++        if (getenv("PRIVEXT_VERIFY_IPS")) verify();
++    }
++    ~init()
++    {
++        deinitmap();
++        deinitgeoip();
++    }
++} init;
++
++} // anonymous namespace
++
++uint32_t getip(const char *countrycode)
++{
++    if (!countrycode) return 0u;
++    pool *p = getpool(countrycode);
++    if (!p) return 0u;
++    return ENET_HOST_TO_NET_32(p->getip());
++}
++
++uint32_t getip(uint32_t ip)
++{
++    if (!geoip) return 0u;
++    ip = ENET_HOST_TO_NET_32(ip);
++    return getip(GeoIP_country_code_by_ipnum(geoip, ip));
++}
++
++} // namespace privext
+Index: fpsgame/privext.h
+===================================================================
+--- fpsgame/privext.h	(Revision 0)
++++ fpsgame/privext.h	(Arbeitskopie)
+@@ -0,0 +1,4 @@
++namespace privext {
++uint32_t getip(const char *countrycode);
++uint32_t getip(uint32_t ip);
++}
+Index: fpsgame/server.cpp
+===================================================================
+--- fpsgame/server.cpp	(Revision 5028)
++++ fpsgame/server.cpp	(Arbeitskopie)
+@@ -1,4 +1,5 @@
+ #include "game.h"
++#include "privext.h"
+ 
+ namespace game
+ {
+Index: shared/cchar.h
+===================================================================
+--- shared/cchar.h	(Revision 0)
++++ shared/cchar.h	(Arbeitskopie)
+@@ -0,0 +1,69 @@
++#ifndef __CCHAR_H__
++#define __CCHAR_H__
++
++#include <cstring>
++
++class cchar
++{
++public:
++    template<typename T>
++    cchar(const T &s) : str(s.data()), len(s.size()) {}
++    cchar(const char *str) : str(str), len(strlen(str)) {}
++    cchar(const char *str, size_t len) : str(str), len(len) {}
++    cchar() : str(), len() {}
++
++    const char *operator()() { return str; }
++    template<typename T>
++    bool operator==(const T &s) const { return equal(s); }
++    template<typename T>
++    bool operator!=(const T &s) const { return !equal(s); }
++    template<typename T>
++
++    bool equal(const T &c) const
++    {
++        if (len != c.size()) return false;
++        return !std::memcmp(str, c.data(), len);
++    }
++    bool equal(const char *s) const { return !std::strcmp(str, s); }
++
++    const char *data() const { return str; }
++    const char *c_str() const { return str; }
++    size_t length() const { return len; }
++    size_t size() const { return len; }
++private:
++    const char *const str;
++    const size_t len;
++};
++
++namespace std
++{
++#ifdef __clang__
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wmismatched-tags"
++#endif // __clang__
++
++    template<>
++    struct hash<cchar>
++    {
++        size_t operator()(const cchar &s) const
++        {
++#ifdef __GLIBCXX__
++            return _Hash_impl::hash(s.data(), s.length());
++#elif defined(_LIBCPP_VERSION)
++            return __do_string_hash(s.data(), s.data() + s.length());
++#else
++#error unsupported c++ library
++#endif // __GLIBCXX__
++        }
++    };
++
++#ifdef __clang__
++#pragma clang diagnostic pop
++#endif // __clang__
++}
++
++static inline const char *getstring(const cchar &str) { return str.c_str(); }
++static inline const char *getstrtype(const cchar str) { std::abort(); }
++static inline const char *getcstring(const cchar &str) { return str.c_str(); }
++
++#endif // __CCHAR_H__
