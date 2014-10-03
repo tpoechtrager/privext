@@ -18,7 +18,7 @@ namespace {
 struct range;
 struct pool;
 
-const size_t maxpoolsize = 100;
+constexpr size_t maxpoolsize = 100u;
 constexpr const char *whoisdbname = "GeoIPCountryWhois.csv";
 constexpr const char *geoipdbname = "GeoIP.dat";
 std::unordered_map<cchar, pool*> ipmap;
@@ -27,7 +27,7 @@ GeoIP *geoip;
 
 void seedrng()
 {
-    unsigned int sv = 0;
+    unsigned int sv = 0u;
 
 #if __has_builtin(__builtin_readcyclecounter)
     sv = (unsigned int)__builtin_readcyclecounter();
@@ -46,6 +46,7 @@ struct range
     uint32_t start;
     uint32_t end;
 
+    bool valid() const { return end >= start; }
     size_t numips() const { return end - start; }
 };
 
@@ -58,7 +59,7 @@ struct pool
     bool isfull() const
     {
         const size_t n = numranges();
-        return (randomips ? n >= maxpoolsize : n >= 1);
+        return (randomips ? n >= maxpoolsize : n >= 1u);
     }
 
     bool addrange(const range &r)
@@ -88,7 +89,9 @@ inline bool skip(const char *&str, int c)
 
 inline const char *findstaticstr(const char *cc)
 {
-    for (auto &scc : GeoIP_country_code) if (!strcmp(scc, cc)) return scc;
+    if (!cc[0] || !cc[1] || cc[2]) return "unknown";
+    for (auto &scc : GeoIP_country_code)
+        if (*(uint16_t*)scc == *(uint16_t*)cc) return scc;
     return "unknown";
 }
 
@@ -136,6 +139,8 @@ void initipmap()
         if (!skip(str, '"')) continue; // ipnum 2
 
         r.end = strtoul(str, NULL, 10);
+
+        if (!r.valid()) continue;
 
         if (!skip(str, '"')) continue;
         if (!skip(str, ',')) continue;
