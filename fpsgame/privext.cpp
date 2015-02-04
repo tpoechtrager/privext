@@ -248,7 +248,7 @@ uint32_t getip(const char *countrycode)
 uint32_t getip(uint32_t ip)
 {
     if (!geoip) return 0u;
-    ip = ENET_HOST_TO_NET_32(ip);
+    ip = ENET_NET_TO_HOST_32(ip);
     return getip(GeoIP_country_code_by_ipnum(geoip, ip));
 }
 
